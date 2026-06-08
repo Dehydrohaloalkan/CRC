@@ -49,7 +49,14 @@ Console.WriteLine();
 // MustMatch=false у версии Z: это стандартный zlib-CRC, он ОБЯЗАН отличаться.
 var variants = new List<(string Name, Func<byte[], uint> Fn, bool MustMatch)> {
     ("v2 (две таблицы)", d => CRCHelper.CalcCrc32V2(d), true),
-    ("v3 (slice-by-8)",  d => CRCHelper.CalcCrc32V3(d), true),
+    ("v3 (ручной s8)",   d => CRCHelper.CalcCrc32V3(d), true),
+    ("v4 (ручной s16)",  d => CRCHelper.CalcCrc32V4(d), true),
+    // кривая «ширина → скорость», обобщённый slice-by-N:
+    ("slice-N=2",        d => CRCHelper.CalcCrc32SliceN(d, 2),  true),
+    ("slice-N=4",        d => CRCHelper.CalcCrc32SliceN(d, 4),  true),
+    ("slice-N=8",        d => CRCHelper.CalcCrc32SliceN(d, 8),  true),
+    ("slice-N=16",       d => CRCHelper.CalcCrc32SliceN(d, 16), true),
+    ("slice-N=32",       d => CRCHelper.CalcCrc32SliceN(d, 32), true),
     ("z (lib, zlib)",    d => CRCHelper.CalcCrc32Z(d),  false),
 };
 if (runBitwise)

@@ -43,6 +43,10 @@ public static class CRCHelper {
     private static readonly uint[][] Slice = new uint[8][];
     private static readonly uint[][] StateMix = new uint[4][];
 
+    // Таблицы slice-by-16 (для V4): та же логика, но ширина блока 16, поэтому M^16 и M^(15-j).
+    private static readonly uint[][] Slice16 = new uint[16][];
+    private static readonly uint[][] StateMix16 = new uint[4][];
+
     static CRCHelper() {
         for (int i = 0; i < 256; i++) {
             Ts[i] = Step8((uint)i, 0);   // состояние = i, входной байт = 0
@@ -57,6 +61,16 @@ public static class CRCHelper {
             StateMix[k] = new uint[256];
             for (int sb = 0; sb < 256; sb++)
                 StateMix[k][sb] = Mk((uint)sb << (8 * k), 8); // M^8 от байта состояния на его позиции
+        }
+        for (int j = 0; j < 16; j++) {
+            Slice16[j] = new uint[256];
+            for (int b = 0; b < 256; b++)
+                Slice16[j][b] = Mk(Tb[b], 15 - j);       // M^(15-j) от вклада байта
+        }
+        for (int k = 0; k < 4; k++) {
+            StateMix16[k] = new uint[256];
+            for (int sb = 0; sb < 256; sb++)
+                StateMix16[k][sb] = Mk((uint)sb << (8 * k), 16); // M^16 от байта состояния
         }
     }
 
@@ -145,6 +159,63 @@ public static class CRCHelper {
     public static uint CalcCrc32V3(ReadOnlySpan<byte> data) => Finish(V3Core(INIT, data));
 
     // =================================================================================
+    //  V4 — SLICE-BY-16, РУЧНОЙ РАЗВОРОТ (16 байт за итерацию).
+    //  --------------------------------------------------------------------------------
+    //  То же, что V3, но ширина блока 16:
+    //        state_16 = M^16(s)  XOR  Σ_{j=0..15}  M^(15-j)( Tb[b_j] )
+    //  Таблицы: Slice16[16][256] (M^(15-j)) и StateMix16[4][256] (M^16).
+    //  Цикл развёрнут вручную (как в V3) — это важно: обобщённый slice-N с циклом по j
+    //  заметно медленнее из-за накладных расходов и хуже использует ILP.
+    //
+    //  Память таблиц: (16 + 4) * 256 * 4 = 20 КБ. Влезает в 32-КБ L1, но запас уже мал —
+    //  на CPU с меньшим L1 выигрыш над V3 может исчезнуть. См. README, раздел про ширину.
+    // =================================================================================
+    public static uint CalcCrc32V4(ReadOnlySpan<byte> data) => Finish(V4Core(INIT, data));
+
+    // =================================================================================
+    //  Обобщённый slice-by-N с произвольной шириной (для исследования «ширина → скорость»).
+    //  Математика та же, что у V3, но ширина блока W — параметр:
+    //      state_W = M^W(s) ⊕ Σ_{j=0}^{W-1} M^(W-1-j)( Tb[b_j] )
+    //  Таблицы под каждую ширину строятся один раз и кешируются. Реализация обобщённая
+    //  (цикл по j вместо ручного разворота), поэтому она показывает ФОРМУ кривой, но в
+    //  абсолюте может уступать ручному V3 на той же ширине 8.
+    // =================================================================================
+    private static readonly Dictionary<int, (uint[] StateMix, uint[] Slice)> _sliceCache = new();
+
+    private static (uint[] StateMix, uint[] Slice) GetSliceTables(int w) {
+        lock (_sliceCache) {
+            if (_sliceCache.TryGetValue(w, out var t)) return t;
+            var stateMix = new uint[4 * 256];           // [k*256 + sb] = M^w(sb << 8k)
+            for (int k = 0; k < 4; k++)
+                for (int sb = 0; sb < 256; sb++)
+                    stateMix[k * 256 + sb] = Mk((uint)sb << (8 * k), w);
+            var slice = new uint[w * 256];              // [j*256 + b] = M^(w-1-j)(Tb[b])
+            for (int j = 0; j < w; j++)
+                for (int b = 0; b < 256; b++)
+                    slice[j * 256 + b] = Mk(Tb[b], w - 1 - j);
+            t = (stateMix, slice);
+            _sliceCache[w] = t;
+            return t;
+        }
+    }
+
+    public static uint CalcCrc32SliceN(ReadOnlySpan<byte> data, int width) {
+        var (stateMix, slice) = GetSliceTables(width);
+        uint s = INIT;
+        int i = 0, lim = data.Length - data.Length % width;
+        for (; i < lim; i += width) {
+            uint acc = stateMix[s & 0xFF] ^ stateMix[256 + ((s >> 8) & 0xFF)]
+                     ^ stateMix[512 + ((s >> 16) & 0xFF)] ^ stateMix[768 + ((s >> 24) & 0xFF)];
+            for (int j = 0; j < width; j++)
+                acc ^= slice[(j << 8) + data[i + j]];
+            s = acc;
+        }
+        for (; i < data.Length; i++)
+            s = (s >> 8) ^ Ts[s & 0xFF] ^ Tb[data[i]];
+        return Finish(s);
+    }
+
+    // =================================================================================
     //  Z — СТАНДАРТНЫЙ CRC-32 ИЗ БИБЛИОТЕКИ (для сравнения, НЕ для протокола ЦБ!).
     //  --------------------------------------------------------------------------------
     //  System.IO.Hashing.Crc32 считает «обычный» CRC-32/ISO-HDLC (zlib, ZIP, PNG, Ethernet)
@@ -187,6 +258,22 @@ public static class CRCHelper {
               ^ StateMix[2][(s >> 16) & 0xFF] ^ StateMix[3][(s >> 24) & 0xFF]
               ^ Slice[0][d[i]]     ^ Slice[1][d[i + 1]] ^ Slice[2][d[i + 2]] ^ Slice[3][d[i + 3]]
               ^ Slice[4][d[i + 4]] ^ Slice[5][d[i + 5]] ^ Slice[6][d[i + 6]] ^ Slice[7][d[i + 7]];
+        }
+        for (; i < d.Length; i++)
+            s = (s >> 8) ^ Ts[s & 0xFF] ^ Tb[d[i]];
+        return s;
+    }
+
+    // Ядро V4: блоки по 16 байт (ручной разворот), хвост — формулой V2.
+    private static uint V4Core(uint s, ReadOnlySpan<byte> d) {
+        int i = 0, lim = d.Length - (d.Length & 15);
+        for (; i < lim; i += 16) {
+            s = StateMix16[0][s & 0xFF] ^ StateMix16[1][(s >> 8) & 0xFF]
+              ^ StateMix16[2][(s >> 16) & 0xFF] ^ StateMix16[3][(s >> 24) & 0xFF]
+              ^ Slice16[0][d[i]]      ^ Slice16[1][d[i + 1]]  ^ Slice16[2][d[i + 2]]  ^ Slice16[3][d[i + 3]]
+              ^ Slice16[4][d[i + 4]]  ^ Slice16[5][d[i + 5]]  ^ Slice16[6][d[i + 6]]  ^ Slice16[7][d[i + 7]]
+              ^ Slice16[8][d[i + 8]]  ^ Slice16[9][d[i + 9]]  ^ Slice16[10][d[i + 10]] ^ Slice16[11][d[i + 11]]
+              ^ Slice16[12][d[i + 12]] ^ Slice16[13][d[i + 13]] ^ Slice16[14][d[i + 14]] ^ Slice16[15][d[i + 15]];
         }
         for (; i < d.Length; i++)
             s = (s >> 8) ^ Ts[s & 0xFF] ^ Tb[d[i]];
