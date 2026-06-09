@@ -1,4 +1,6 @@
 using System.Buffers;
+using System.Collections.Concurrent;
+using System.Numerics;
 
 namespace CRC.Helpers;
 
@@ -47,6 +49,12 @@ public static class CRCHelper {
     private static readonly uint[][] Slice16 = new uint[16][];
     private static readonly uint[][] StateMix16 = new uint[4][];
 
+    // Оператор M как матрица 32x32 над GF(2) (для V5/CombineState). ByteMat[i] = M(1<<i) —
+    // образ i-го базисного вектора при распространении состояния на ОДИН байт. Этого хватает,
+    // чтобы матрично возводить M в любую степень L и применять M^L к 32-битному состоянию за
+    // O(32 log L) вместо O(L) проходов M — то есть «склеивать» независимо посчитанные куски.
+    private static readonly uint[] ByteMat = new uint[32];
+
     static CRCHelper() {
         for (int i = 0; i < 256; i++) {
             Ts[i] = Step8((uint)i, 0);   // состояние = i, входной байт = 0
@@ -72,6 +80,8 @@ public static class CRCHelper {
             for (int sb = 0; sb < 256; sb++)
                 StateMix16[k][sb] = Mk((uint)sb << (8 * k), 16); // M^16 от байта состояния
         }
+        for (int i = 0; i < 32; i++)
+            ByteMat[i] = M(1u << i);                              // столбцы матрицы M (после заполнения Ts)
     }
 
     // =================================================================================
@@ -213,6 +223,144 @@ public static class CRCHelper {
         for (; i < data.Length; i++)
             s = (s >> 8) ^ Ts[s & 0xFF] ^ Tb[data[i]];
         return Finish(s);
+    }
+
+    // =================================================================================
+    //  V5 — МНОГОПОТОЧНО + ПОТОКОВО (склейка независимых кусков).
+    //  --------------------------------------------------------------------------------
+    //  V1–V4 ускоряли ОДИН последовательный проход. V5 распараллеливает сам проход по
+    //  ядрам, оставаясь бит-в-бит совместимым с протоколом ЦБ.
+    //
+    //  Ключ — та же линейность. Обработка L байт из состояния s раскладывается на вклад
+    //  состояния и вклад данных, не зависящие друг от друга:
+    //
+    //        F(s, chunk) = M^L(s)  XOR  F(0, chunk)
+    //
+    //  Значит данные можно нарезать на куски и посчитать partial_i = F(0, chunk_i) НЕЗАВИСИМО
+    //  в разных потоках (каждый стартует с нуля, V3Core). Затем — строго последовательная,
+    //  но дешёвая «склейка» по порядку кусков:
+    //
+    //        s = INIT;  для каждого i:  s = M^{L_i}(s) XOR partial_i;   return Finish(s)
+    //
+    //  Дорогое здесь — M^{L_i} (L_i ~ миллионы байт), поэтому M возводится в степень не
+    //  прогоном по байтам, а матрично над GF(2) за O(32 log L) (см. MatPow/ApplyOp). Все
+    //  куски кроме последнего одной длины ⇒ M^L считается один раз и переиспользуется.
+    //
+    //  Корректность: склейка даёт ровно ту же последовательность состояний, что и сплошной
+    //  проход V3 ⇒ V5 == V1..V4 при любом числе потоков и любой нарезке.
+    // =================================================================================
+
+    // Версия для готового массива в памяти: режем на ~равные части по числу ядер и считаем
+    // их параллельно (Parallel.For), затем склеиваем. Мелкие данные — просто последовательно.
+    public static uint CalcCrc32V5(byte[] data, int degreeOfParallelism = 0) {
+        if (degreeOfParallelism <= 0) degreeOfParallelism = Environment.ProcessorCount;
+        const int MinPerThread = 1 << 16;                 // мельчить нет смысла — накладные расходы съедят выигрыш
+        int n = data.Length;
+        int parts = Math.Clamp(n / MinPerThread, 1, degreeOfParallelism);
+        if (parts <= 1)
+            return Finish(V3Core(INIT, data));
+
+        int baseLen = n / parts;
+        var partial = new uint[parts];
+        var lens = new int[parts];
+        Parallel.For(0, parts, p => {
+            int start = p * baseLen;
+            int len = (p == parts - 1) ? n - start : baseLen;  // хвост достаётся последней части
+            lens[p] = len;
+            partial[p] = V3Core(0u, data.AsSpan(start, len)); // partial = F(0, chunk), без INIT
+        });
+        return CombineParts(partial, lens, parts);
+    }
+
+    // Потоковая версия: читатель сливает куски фиксированного размера из Stream в очередь,
+    // пул воркеров считает их partial-суммы, в конце — склейка по порядку. Память ограничена
+    // (в полёте максимум ~degreeOfParallelism буферов), поэтому подходит для файлов любого размера.
+    public static uint CalcCrc32V5(Stream stream, int degreeOfParallelism = 0) {
+        if (degreeOfParallelism <= 0) degreeOfParallelism = Environment.ProcessorCount;
+        const int ChunkSize = 1 << 20;                    // 1 МБ на кусок
+
+        var queue = new BlockingCollection<(int Idx, byte[] Buf, int Len)>(degreeOfParallelism * 2);
+        var results = new ConcurrentDictionary<int, (uint Partial, int Len)>();
+
+        var workers = new Task[degreeOfParallelism];
+        for (int w = 0; w < degreeOfParallelism; w++) {
+            workers[w] = Task.Run(() => {
+                foreach (var item in queue.GetConsumingEnumerable()) {
+                    uint p = V3Core(0u, item.Buf.AsSpan(0, item.Len));
+                    results[item.Idx] = (p, item.Len);
+                    ArrayPool<byte>.Shared.Return(item.Buf);
+                }
+            });
+        }
+
+        int idx = 0;
+        while (true) {
+            byte[] buf = ArrayPool<byte>.Shared.Rent(ChunkSize);
+            int total = ReadFull(stream, buf, ChunkSize);
+            if (total == 0) { ArrayPool<byte>.Shared.Return(buf); break; }
+            queue.Add((idx++, buf, total));
+            if (total < ChunkSize) break;                 // короткий кусок = конец потока
+        }
+        queue.CompleteAdding();
+        Task.WaitAll(workers);
+
+        int count = idx;
+        var partial = new uint[count];
+        var lens = new int[count];
+        for (int i = 0; i < count; i++)
+            (partial[i], lens[i]) = results[i];
+        return CombineParts(partial, lens, count);
+    }
+
+    // Последовательная склейка partial-сумм кусков: s = M^{L_i}(s) XOR partial_i, затем Finish.
+    private static uint CombineParts(uint[] partial, int[] lens, int count) {
+        if (count == 0) return Finish(INIT);
+        uint[] opBase = MatPow(ByteMat, lens[0]);         // длина общая для всех, кроме хвоста
+        int baseLen = lens[0];
+        uint s = INIT;
+        for (int i = 0; i < count; i++) {
+            uint[] op = (lens[i] == baseLen) ? opBase : MatPow(ByteMat, lens[i]);
+            s = ApplyOp(op, s) ^ partial[i];
+        }
+        return Finish(s);
+    }
+
+    private static int ReadFull(Stream s, byte[] buf, int want) {
+        int total = 0, read;
+        while (total < want && (read = s.Read(buf, total, want - total)) > 0)
+            total += read;
+        return total;
+    }
+
+    // ---- арифметика операторов M над GF(2) (матрица 32x32, столбец = образ базисного вектора) ----
+
+    // Применить оператор к состоянию: v = XOR столбцов mat по выставленным битам v.
+    private static uint ApplyOp(uint[] mat, uint v) {
+        uint r = 0;
+        while (v != 0) {
+            r ^= mat[BitOperations.TrailingZeroCount(v)];
+            v &= v - 1;
+        }
+        return r;
+    }
+
+    // Композиция операторов (сначала b, потом a). Все степени одного M коммутируют.
+    private static uint[] MatMul(uint[] a, uint[] b) {
+        var c = new uint[32];
+        for (int i = 0; i < 32; i++) c[i] = ApplyOp(a, b[i]);
+        return c;
+    }
+
+    // M^bytes бинарным возведением в степень: O(32 log bytes) вместо bytes проходов M.
+    private static uint[] MatPow(uint[] mat, long bytes) {
+        var result = new uint[32];
+        for (int i = 0; i < 32; i++) result[i] = 1u << i;  // единичная матрица
+        var basePow = (uint[])mat.Clone();
+        for (long e = bytes; e > 0; e >>= 1) {
+            if ((e & 1) != 0) result = MatMul(basePow, result);
+            basePow = MatMul(basePow, basePow);
+        }
+        return result;
     }
 
     // =================================================================================

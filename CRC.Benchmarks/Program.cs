@@ -57,6 +57,7 @@ var variants = new List<(string Name, Func<byte[], uint> Fn, bool MustMatch)> {
     ("slice-N=8",        d => CRCHelper.CalcCrc32SliceN(d, 8),  true),
     ("slice-N=16",       d => CRCHelper.CalcCrc32SliceN(d, 16), true),
     ("slice-N=32",       d => CRCHelper.CalcCrc32SliceN(d, 32), true),
+    ("v5 (многопоточно)", d => CRCHelper.CalcCrc32V5(d), true),
     ("z (lib, zlib)",    d => CRCHelper.CalcCrc32Z(d),  false),
 };
 if (runBitwise)
