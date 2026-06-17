@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <PackageId>Crc.Custom</PackageId>
+    <Description>Non-standard CRC-32 (custom convention): LSB-first, feedback from bit 0, 32-bit flush, inverted output. Reference value: "123456789" → 0x22896B0A.</Description>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Text.Encoding.CodePages" Version="10.0.0" />
+  </ItemGroup>
+
+</Project>

@@ -1,4 +1,0 @@
-<Solution>
-  <Project Path="CRC.csproj" />
-  <Project Path="CRC.Benchmarks\CRC.Benchmarks.csproj" />
-</Solution>

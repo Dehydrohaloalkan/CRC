@@ -1,6 +1,10 @@
 # Build results
 bin/
 obj/
+dist/
+
+# NuGet packages
+*.nupkg
 
 # .NET
 *.user

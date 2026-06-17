@@ -1,0 +1,60 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="clr-namespace:Crc.Desktop.ViewModels"
+        x:Class="Crc.Desktop.Views.MainWindow"
+        Title="CRC-32" Width="800" Height="560"
+        MinWidth="600" MinHeight="400">
+
+  <Window.DataContext>
+    <vm:MainViewModel />
+  </Window.DataContext>
+
+  <DockPanel Margin="12">
+
+    <!-- Top controls -->
+    <StackPanel DockPanel.Dock="Top" Spacing="8" Margin="0,0,0,8">
+
+      <TextBlock Text="File or Directory" FontWeight="SemiBold" />
+
+      <Grid ColumnDefinitions="*,Auto,Auto">
+        <TextBox Grid.Column="0"
+                 Text="{Binding TargetPath}"
+                 Watermark="Path to file or directory…"
+                 VerticalAlignment="Center" />
+        <Button Grid.Column="1" Content="Browse…" Margin="6,0,0,0"
+                Click="OnBrowseClick" />
+        <Button Grid.Column="2" Content="Compute"  Margin="6,0,0,0"
+                Command="{Binding ComputeCommand}"
+                IsEnabled="{Binding !IsRunning}" />
+      </Grid>
+
+      <CheckBox Content="Legacy mode (Windows-1251, CRLF, backslashes)"
+                IsChecked="{Binding LegacyMode}" />
+    </StackPanel>
+
+    <!-- Status bar -->
+    <Border DockPanel.Dock="Bottom" Background="#F0F0F0"
+            BorderThickness="0,1,0,0" BorderBrush="#CCCCCC"
+            Padding="8,4">
+      <DockPanel>
+        <Button DockPanel.Dock="Right" Content="Save…"
+                IsEnabled="{Binding !IsRunning}"
+                Click="OnSaveClick" />
+        <TextBlock Text="{Binding StatusText}" VerticalAlignment="Center" />
+      </DockPanel>
+    </Border>
+
+    <!-- Results grid -->
+    <DataGrid ItemsSource="{Binding Results}"
+              IsReadOnly="True"
+              GridLinesVisibility="Horizontal"
+              CanUserResizeColumns="True">
+      <DataGrid.Columns>
+        <DataGridTextColumn Header="Path" Binding="{Binding Path}" Width="*" />
+        <DataGridTextColumn Header="CRC-32" Binding="{Binding Crc}" Width="120"
+                            FontFamily="Consolas,Courier New,monospace" />
+      </DataGrid.Columns>
+    </DataGrid>
+
+  </DockPanel>
+</Window>
